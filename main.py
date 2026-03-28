@@ -241,23 +241,36 @@ def start_sleep(request: SleepStartRequest, user_id: int = Depends(get_current_u
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# 9. 수면: 수면 종료
+# 9. 수면: 수면 종료 (수정본)
 @app.post("/api/sleep/stop")
 def stop_sleep(request: SleepStopRequest, user_id: int = Depends(get_current_user_id)):
     try:
         current_time_dt = datetime.now(timezone.utc)
         current_time_iso = current_time_dt.isoformat()
         
+        # 1. 시작 시간 조회
         record_res = supabase.table("sleep_records").select("start_time").eq("id", request.session_id).single().execute()
         start_time_dt = datetime.fromisoformat(record_res.data['start_time'].replace('Z', '+00:00'))
         
+        # 2. 총 수면 시간 계산
         diff = current_time_dt - start_time_dt
         total_minutes = int(diff.total_seconds() // 60)
         
+        # 3. 유저의 목표 수면 시간 조회 및 달성 여부 판단
+        # users 테이블의 sleep_goal_time(int4, 분 단위)을 기준으로 계산합니다. 값이 없으면 420분(7시간)으로 임의 적용합니다.
+        user_res = supabase.table("users").select("sleep_goal_time").eq("id", user_id).single().execute()
+        goal_minutes = user_res.data.get('sleep_goal_time')
+        if not goal_minutes:
+            goal_minutes = 420 
+            
+        is_achieved = total_minutes >= goal_minutes
+        
+        # 4. 수면 기록 및 유저 상태 업데이트
         supabase.table("sleep_records").update({
             "end_time": current_time_iso,
             "status": "awake",
-            "total_sleep_minutes": total_minutes
+            "total_sleep_minutes": total_minutes,
+            "is_goal_achieved": is_achieved
         }).eq("id", request.session_id).execute()
         
         supabase.table("users").update({"current_status": "awake"}).eq("id", user_id).execute()
@@ -266,7 +279,8 @@ def stop_sleep(request: SleepStopRequest, user_id: int = Depends(get_current_use
             "status": "success",
             "data": {
                 "end_time": current_time_iso,
-                "total_sleep_minutes": total_minutes
+                "total_sleep_minutes": total_minutes,
+                "is_goal_achieved": is_achieved
             }
         }
     except Exception as e:
@@ -339,21 +353,55 @@ def get_notifications(page: int = 1, user_id: int = Depends(get_current_user_id)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-# 14. 메뉴: 리포트 조회
+# 14. 메뉴: 리포트 조회 (수정본)
 @app.get("/api/reports")
 def get_reports(period: str = "weekly", user_id: int = Depends(get_current_user_id)):
     try:
-        records_res = supabase.table("sleep_records").select("total_sleep_minutes").eq("user_id", user_id).execute()
+        # 해당 유저의 수면 기록 조회 (total_sleep_minutes가 존재하는 완료된 세션 기준)
+        records_res = supabase.table("sleep_records").select("total_sleep_minutes, is_goal_achieved").eq("user_id", user_id).execute()
         
-        total_minutes_list = [r['total_sleep_minutes'] for r in records_res.data if r.get('total_sleep_minutes') is not None]
-        avg_minutes = sum(total_minutes_list) / len(total_minutes_list) if total_minutes_list else 0
+        valid_records = [r for r in records_res.data if r.get('total_sleep_minutes') is not None]
+        total_count = len(valid_records)
+        
+        if total_count == 0:
+            return {
+                "status": "success",
+                "data": {
+                    "avg_sleep_minutes": 0,
+                    "achievement_rate": 0
+                }
+            }
+            
+        total_minutes_list = [r['total_sleep_minutes'] for r in valid_records]
+        avg_minutes = sum(total_minutes_list) / total_count
+        
+        achieved_count = sum(1 for r in valid_records if r.get('is_goal_achieved') is True)
+        achievement_rate = int((achieved_count / total_count) * 100)
         
         return {
             "status": "success",
             "data": {
                 "avg_sleep_minutes": int(avg_minutes),
-                "achievement_rate": 0
+                "achievement_rate": achievement_rate
             }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# 15. 수면: 수면 결과 상세 조회
+@app.get("/api/sleep/records/{session_id}")
+def get_sleep_record(session_id: str, user_id: int = Depends(get_current_user_id)):
+    try:
+        record_res = supabase.table("sleep_records").select(
+            "start_time, end_time, total_sleep_minutes, is_goal_achieved"
+        ).eq("id", session_id).single().execute()
+        
+        if not record_res.data:
+            raise ValueError("해당 수면 기록을 찾을 수 없습니다.")
+            
+        return {
+            "status": "success",
+            "data": record_res.data
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
