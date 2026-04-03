@@ -68,6 +68,9 @@ class UserInfoUpdateRequest(BaseModel):
 class GroupChangeRequest(BaseModel):
     group_id: str # UUID 문자열 형태로 변경
 
+class PokeRequest(BaseModel):
+    targetUserId: str
+
 # --- API 엔드포인트 구현 ---
 
 @app.get("/")
@@ -170,17 +173,60 @@ def get_sleep_feed(user_id: str = Depends(get_current_user_id)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.post("/api/users/{target_id}/poke")
-def poke_user(target_id: str, user_id: str = Depends(get_current_user_id)):
+@app.post("/api/poke")
+def poke_user(request: PokeRequest, user_id: str = Depends(get_current_user_id)):
     try:
-        supabase.table("pokes").insert({"sender_id": user_id, "receiver_id": target_id}).execute()
+        target_id = request.targetUserId
+        
+        # 찌르기 기록 추가
+        supabase.table("pokes").insert({
+            "sender_id": user_id, 
+            "receiver_id": target_id
+        }).execute()
+        
+        # 알림 기록 추가
         supabase.table("notifications").insert({
             "user_id": target_id, 
             "type": "poke", 
             "content": "콕 찌르기 알림을 받았습니다.", 
             "is_read": False
         }).execute()
+        
         return {"status": "success", "message": "찌르기 알림을 전송했습니다."}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/poke/notification")
+def check_poke_notification(user_id: str = Depends(get_current_user_id)):
+    try:
+        # 1. 읽지 않은 찌르기 알림이 있는지 확인
+        noti_res = supabase.table("notifications").select("id").eq("user_id", user_id).eq("type", "poke").eq("is_read", False).order("created_at", desc=True).limit(1).execute()
+        
+        # 미확인 알림이 없을 경우 null 반환
+        if not noti_res.data:
+            return {"status": "success", "data": None}
+            
+        # 2. pokes 테이블에서 가장 최근에 나를 찌른 사용자 ID 조회
+        poke_res = supabase.table("pokes").select("sender_id").eq("receiver_id", user_id).order("created_at", desc=True).limit(1).execute()
+        
+        if not poke_res.data:
+             return {"status": "success", "data": None}
+             
+        sender_id = poke_res.data[0]['sender_id']
+        
+        # 발신자의 닉네임 조회
+        sender_res = supabase.table("users").select("nickname").eq("id", sender_id).single().execute()
+        sender_nickname = sender_res.data.get("nickname")
+        
+        # 3. 알림을 읽음 처리로 업데이트
+        supabase.table("notifications").update({"is_read": True}).eq("id", noti_res.data[0]['id']).execute()
+        
+        return {
+            "status": "success",
+            "data": {
+                "fromNickname": sender_nickname
+            }
+        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -243,8 +289,6 @@ def stop_sleep(request: SleepStopRequest, user_id: str = Depends(get_current_use
             start_time_kst = start_time_utc.astimezone(KST)
             
             # 2. 자정 경계 오류 방지를 위한 12시간 시프트(Shift) 계산
-            # 정오(12:00)를 기준점인 0분으로 설정하여 상대적인 분(minute) 값을 계산합니다.
-            # 예: 23:00 -> 660분, 01:00 -> 780분으로 변환되어 정상적인 대소 비교가 가능합니다.
             shifted_start_hour = (start_time_kst.hour - 12) % 24
             shifted_target_hour = (target_h - 12) % 24
             
