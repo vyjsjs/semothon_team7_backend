@@ -205,16 +205,32 @@ def stop_sleep(request: SleepStopRequest, user_id: str = Depends(get_current_use
         current_time_dt = datetime.now(timezone.utc)
         current_time_iso = current_time_dt.isoformat()
         
+        # 1. 수면 시작 기록 조회
         record_res = supabase.table("sleep_records").select("start_time").eq("id", request.session_id).single().execute()
         start_time_dt = datetime.fromisoformat(record_res.data['start_time'].replace('Z', '+00:00'))
         
+        # 2. 목표 취침 시각(target_time) 조회
+        user_res = supabase.table("users").select("target_time").eq("id", user_id).single().execute()
+        target_time_str = user_res.data.get("target_time")
+        
+        # 3. 목표 달성 여부 판단 (시각 비교 로직)
+        is_achieved = False
+        if target_time_str:
+            target_h, target_m = map(int, target_time_str.split(':'))
+            from datetime import time
+            target_time_obj = time(target_h, target_m)
+            
+            actual_time = start_time_dt.time()
+            
+            # 수면 시작 시각이 목표 시각보다 이전이거나 같으면 성공 처리
+            # (주의: 자정 이후 취침 등 복잡한 날짜 경계 계산이 필요할 경우 추가 로직이 요구될 수 있습니다.)
+            is_achieved = actual_time <= target_time_obj
+        
+        # 4. 전체 수면 시간(분) 계산 (리포트 통계용)
         diff = current_time_dt - start_time_dt
         total_minutes = int(diff.total_seconds() // 60)
         
-        user_res = supabase.table("users").select("sleep_goal_time").eq("id", user_id).single().execute()
-        goal_minutes = user_res.data.get('sleep_goal_time') or 420 
-        is_achieved = total_minutes >= goal_minutes
-        
+        # 5. DB 데이터 업데이트
         supabase.table("sleep_records").update({
             "end_time": current_time_iso,
             "status": "awake",
