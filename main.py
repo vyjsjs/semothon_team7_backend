@@ -104,12 +104,19 @@ def create_group(request: GroupRequest, user_id: str = Depends(get_current_user_
 @app.post("/api/groups/join")
 def join_group(request: GroupJoinRequest, user_id: str = Depends(get_current_user_id)):
     try:
+        # 1. 초대 코드 유효성 검증
         group_res = supabase.table("groups").select("id, name").eq("invite_code", request.invite_code).execute()
         if not group_res.data:
             raise ValueError("유효하지 않은 초대 코드입니다.")
             
         group_id = group_res.data[0]['id']
-        supabase.table("group_member").insert({"group_id": group_id, "user_id": user_id}).execute()
+        
+        # 2. 기존 그룹 가입 여부 확인 및 분기 처리
+        existing = supabase.table("group_member").select("id").eq("user_id", user_id).execute()
+        if existing.data:
+            supabase.table("group_member").update({"group_id": group_id}).eq("user_id", user_id).execute()
+        else:
+            supabase.table("group_member").insert({"group_id": group_id, "user_id": user_id}).execute()
         
         return {
             "status": "success",
@@ -180,6 +187,22 @@ def poke_user(target_id: str, user_id: str = Depends(get_current_user_id)):
 @app.post("/api/sleep/start")
 def start_sleep(request: SleepStartRequest, user_id: str = Depends(get_current_user_id)):
     try:
+        # 1. 진행 중인 수면 세션 존재 여부 확인
+        existing_res = supabase.table("sleep_records").select("id, start_time").eq(
+            "user_id", user_id
+        ).eq("status", "sleeping").is_("end_time", "null").execute()
+        
+        if existing_res.data:
+            return {
+                "status": "success",
+                "data": {
+                    "session_id": str(existing_res.data[0]['id']),
+                    "start_time": existing_res.data[0]['start_time'],
+                    "message": "기존 진행 중인 수면 기록을 반환합니다."
+                }
+            }
+
+        # 2. 새로운 수면 기록 생성
         current_time = datetime.now(timezone.utc).isoformat()
         record_res = supabase.table("sleep_records").insert({
             "user_id": user_id,
@@ -205,32 +228,34 @@ def stop_sleep(request: SleepStopRequest, user_id: str = Depends(get_current_use
         current_time_dt = datetime.now(timezone.utc)
         current_time_iso = current_time_dt.isoformat()
         
-        # 1. 수면 시작 기록 조회
         record_res = supabase.table("sleep_records").select("start_time").eq("id", request.session_id).single().execute()
-        start_time_dt = datetime.fromisoformat(record_res.data['start_time'].replace('Z', '+00:00'))
+        start_time_utc = datetime.fromisoformat(record_res.data['start_time'].replace('Z', '+00:00'))
         
-        # 2. 목표 취침 시각(target_time) 조회
         user_res = supabase.table("users").select("target_time").eq("id", user_id).single().execute()
         target_time_str = user_res.data.get("target_time")
         
-        # 3. 목표 달성 여부 판단 (시각 비교 로직)
         is_achieved = False
         if target_time_str:
             target_h, target_m = map(int, target_time_str.split(':'))
-            from datetime import time
-            target_time_obj = time(target_h, target_m)
             
-            actual_time = start_time_dt.time()
+            # 1. 수면 시작 시각을 KST(한국 표준시)로 변환
+            KST = timezone(timedelta(hours=9))
+            start_time_kst = start_time_utc.astimezone(KST)
             
-            # 수면 시작 시각이 목표 시각보다 이전이거나 같으면 성공 처리
-            # (주의: 자정 이후 취침 등 복잡한 날짜 경계 계산이 필요할 경우 추가 로직이 요구될 수 있습니다.)
-            is_achieved = actual_time <= target_time_obj
+            # 2. 자정 경계 오류 방지를 위한 12시간 시프트(Shift) 계산
+            # 정오(12:00)를 기준점인 0분으로 설정하여 상대적인 분(minute) 값을 계산합니다.
+            # 예: 23:00 -> 660분, 01:00 -> 780분으로 변환되어 정상적인 대소 비교가 가능합니다.
+            shifted_start_hour = (start_time_kst.hour - 12) % 24
+            shifted_target_hour = (target_h - 12) % 24
+            
+            shifted_start_minutes = shifted_start_hour * 60 + start_time_kst.minute
+            shifted_target_minutes = shifted_target_hour * 60 + target_m
+            
+            is_achieved = shifted_start_minutes <= shifted_target_minutes
         
-        # 4. 전체 수면 시간(분) 계산 (리포트 통계용)
-        diff = current_time_dt - start_time_dt
+        diff = current_time_dt - start_time_utc
         total_minutes = int(diff.total_seconds() // 60)
         
-        # 5. DB 데이터 업데이트
         supabase.table("sleep_records").update({
             "end_time": current_time_iso,
             "status": "awake",
@@ -324,34 +349,27 @@ WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
 def get_reports(period: str = "weekly", user_id: str = Depends(get_current_user_id)):
     try:
         if period == "weekly":
-            # 1. 기준 시간 계산 (현재 시점으로부터 7일 전, UTC 기준)
             now_utc = datetime.now(timezone.utc)
             seven_days_ago = now_utc - timedelta(days=7)
             
-            # 2. 데이터베이스 조회 (7일 이내 데이터, 과거순 정렬)
             records_res = supabase.table("sleep_records").select(
                 "start_time, is_goal_achieved"
             ).eq("user_id", user_id).gte(
                 "start_time", seven_days_ago.isoformat()
             ).order("start_time", desc=False).execute()
             
-            # 3. 일별 기록 병합 처리
             daily_records = {}
             
             for record in records_res.data:
                 start_time_str = record.get("start_time")
                 is_achieved = record.get("is_goal_achieved")
                 
-                # UTC 문자열을 datetime 객체로 파싱 후 KST로 변환
                 dt_utc = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
                 dt_kst = dt_utc.astimezone(KST)
                 
-                # 날짜 문자열(YYYY-MM-DD) 추출
                 date_key = dt_kst.strftime("%Y-%m-%d")
                 
                 if date_key not in daily_records:
-                    # 해당 날짜의 첫 기록 생성
-                    # order("start_time", desc=False)로 인해 가장 이른 수면 시간이 기록됨
                     daily_records[date_key] = {
                         "date": date_key,
                         "weekday": WEEKDAYS[dt_kst.weekday()],
@@ -359,23 +377,30 @@ def get_reports(period: str = "weekly", user_id: str = Depends(get_current_user_
                         "is_goal_achieved": is_achieved
                     }
                 else:
-                    # 동일 날짜에 추가 기록이 있는 경우 (병합 로직)
-                    # 하루 중 한 번이라도 목표에 성공했다면 True로 갱신
                     if is_achieved:
                         daily_records[date_key]["is_goal_achieved"] = True
-                        
-            # 딕셔너리 값을 리스트로 변환
+            
             report_data = list(daily_records.values())
+            
+            # --- 주간 달성률 계산 로직 추가 ---
+            valid_days = len(report_data) # 데이터가 존재하는 일수
+            achieved_days = sum(1 for record in report_data if record.get("is_goal_achieved")) # 성공한 일수
+            
+            # 데이터 공백 제외 달성률 계산 (정수형)
+            achievement_rate = int((achieved_days / valid_days) * 100) if valid_days > 0 else 0
             
             return {
                 "status": "success",
                 "data": {
                     "period": "weekly",
-                    "records": report_data
+                    "records": report_data,
+                    "achievement_rate": achievement_rate,
+                    "valid_days": valid_days,
+                    "achieved_days": achieved_days
                 }
             }
         else:
-            return {"status": "success", "data": {"period": period, "records": []}}
+            return {"status": "success", "data": {"period": period, "records": [], "achievement_rate": 0}}
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
