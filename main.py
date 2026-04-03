@@ -9,7 +9,7 @@ import uuid
 import random
 import string
 from typing import List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 load_dotenv()
 
@@ -315,26 +315,67 @@ def get_notifications(page: int = 1, user_id: str = Depends(get_current_user_id)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+# KST 타임존 설정 (UTC+9)
+KST = timezone(timedelta(hours=9))
+# 요일 매핑 배열
+WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
+
 @app.get("/api/reports")
 def get_reports(period: str = "weekly", user_id: str = Depends(get_current_user_id)):
     try:
-        records_res = supabase.table("sleep_records").select("total_sleep_minutes, is_goal_achieved").eq("user_id", user_id).execute()
-        valid_records = [r for r in records_res.data if r.get('total_sleep_minutes') is not None]
-        total_count = len(valid_records)
-        
-        if total_count == 0:
-            return {"status": "success", "data": {"avg_sleep_minutes": 0, "achievement_rate": 0}}
+        if period == "weekly":
+            # 1. 기준 시간 계산 (현재 시점으로부터 7일 전, UTC 기준)
+            now_utc = datetime.now(timezone.utc)
+            seven_days_ago = now_utc - timedelta(days=7)
             
-        avg_minutes = sum(r['total_sleep_minutes'] for r in valid_records) / total_count
-        achieved_count = sum(1 for r in valid_records if r.get('is_goal_achieved') is True)
-        achievement_rate = int((achieved_count / total_count) * 100)
-        
-        return {
-            "status": "success",
-            "data": {
-                "avg_sleep_minutes": int(avg_minutes),
-                "achievement_rate": achievement_rate
+            # 2. 데이터베이스 조회 (7일 이내 데이터, 과거순 정렬)
+            records_res = supabase.table("sleep_records").select(
+                "start_time, is_goal_achieved"
+            ).eq("user_id", user_id).gte(
+                "start_time", seven_days_ago.isoformat()
+            ).order("start_time", desc=False).execute()
+            
+            # 3. 일별 기록 병합 처리
+            daily_records = {}
+            
+            for record in records_res.data:
+                start_time_str = record.get("start_time")
+                is_achieved = record.get("is_goal_achieved")
+                
+                # UTC 문자열을 datetime 객체로 파싱 후 KST로 변환
+                dt_utc = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
+                dt_kst = dt_utc.astimezone(KST)
+                
+                # 날짜 문자열(YYYY-MM-DD) 추출
+                date_key = dt_kst.strftime("%Y-%m-%d")
+                
+                if date_key not in daily_records:
+                    # 해당 날짜의 첫 기록 생성
+                    # order("start_time", desc=False)로 인해 가장 이른 수면 시간이 기록됨
+                    daily_records[date_key] = {
+                        "date": date_key,
+                        "weekday": WEEKDAYS[dt_kst.weekday()],
+                        "start_time": start_time_str, 
+                        "is_goal_achieved": is_achieved
+                    }
+                else:
+                    # 동일 날짜에 추가 기록이 있는 경우 (병합 로직)
+                    # 하루 중 한 번이라도 목표에 성공했다면 True로 갱신
+                    if is_achieved:
+                        daily_records[date_key]["is_goal_achieved"] = True
+                        
+            # 딕셔너리 값을 리스트로 변환
+            report_data = list(daily_records.values())
+            
+            return {
+                "status": "success",
+                "data": {
+                    "period": "weekly",
+                    "records": report_data
+                }
             }
-        }
+        else:
+            return {"status": "success", "data": {"period": period, "records": []}}
+
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
