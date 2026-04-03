@@ -448,3 +448,43 @@ def get_reports(period: str = "weekly", user_id: str = Depends(get_current_user_
 
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/api/groups/my")
+def get_my_groups(user_id: str = Depends(get_current_user_id)):
+    try:
+        # 1. group_member 테이블에서 사용자가 속한 그룹 ID 및 가입일 조회
+        gm_res = supabase.table("group_member").select(
+            "group_id, joined_at"
+        ).eq("user_id", user_id).execute()
+        
+        # 소속된 그룹이 없는 경우 빈 리스트 반환
+        if not gm_res.data:
+            return {"status": "success", "data": []}
+            
+        group_ids = [str(gm['group_id']) for gm in gm_res.data]
+        
+        # 2. groups 테이블에서 해당 그룹들의 상세 정보(이름, 초대코드) 조회
+        groups_res = supabase.table("groups").select(
+            "id, name, invite_code"
+        ).in_("id", group_ids).execute()
+        
+        # 그룹 정보를 ID를 키로 하는 딕셔너리로 변환 (빠른 매핑을 위함)
+        groups_dict = {str(g['id']): g for g in groups_res.data}
+        
+        group_list = []
+        for gm in gm_res.data:
+            g_id = str(gm['group_id'])
+            if g_id in groups_dict:
+                group_list.append({
+                    "group_id": g_id,
+                    "group_name": groups_dict[g_id]['name'],
+                    "invite_code": groups_dict[g_id]['invite_code'],
+                    "joined_at": gm.get('joined_at')
+                })
+                
+        return {
+            "status": "success",
+            "data": group_list
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
