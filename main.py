@@ -167,7 +167,8 @@ def get_sleep_feed(user_id: str = Depends(get_current_user_id)):
         
         users_res = supabase.table("users").select("id, nickname, current_status").in_("id", member_ids).execute()
         
-        feed_data = [{"user_id": str(u['id']), "nickname": u['nickname'], "status": u.get('current_status', 'awake')} for u in users_res.data]
+        # 수정된 부분: 응답 데이터의 키를 'status'에서 'current_status'로 변경하여 다른 API와 통일합니다.
+        feed_data = [{"user_id": str(u['id']), "nickname": u['nickname'], "current_status": u.get('current_status', 'awake')} for u in users_res.data]
             
         return {"status": "success", "data": feed_data}
     except Exception as e:
@@ -239,6 +240,9 @@ def start_sleep(request: SleepStartRequest, user_id: str = Depends(get_current_u
         ).eq("status", "sleeping").is_("end_time", "null").execute()
         
         if existing_res.data:
+            # 수정된 부분: 기존 세션이 존재하더라도 users 테이블의 상태를 sleeping으로 확실히 업데이트합니다.
+            supabase.table("users").update({"current_status": "sleeping"}).eq("id", user_id).execute()
+            
             return {
                 "status": "success",
                 "data": {
